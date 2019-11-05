@@ -16,11 +16,13 @@ limitations under the License.
 #include "tensorflow_serving/model_servers/server_core.h"
 
 #include <utility>
+#include <vector>
 
 #include "google/protobuf/any.pb.h"
 #include "google/protobuf/wrappers.pb.h"
 #include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/lib/io/path.h"
+#include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow_serving/core/load_servables_fast.h"
 #include "tensorflow_serving/model_servers/model_platform_types.h"
@@ -100,13 +102,6 @@ Status ValidateModelConfigList(const ModelConfigList& config_list,
           strings::StrCat("Expected non-empty absolute path or URI; got "
                           "model_config_list_root_dir=",
                           *options.model_config_list_root_dir));
-    }
-    for (const ModelConfig& config : config_list.config()) {
-      if (!UriIsRelativePath(config.base_path())) {
-        return errors::InvalidArgument(strings::StrCat(
-            "Expected model ", config.name(),
-            " to have a relative path; got base_path()=", config.base_path()));
-      }
     }
   } else {
     // All base-paths must be absolute.
@@ -200,6 +195,11 @@ Status UpdateModelConfigListRelativePaths(
   std::vector<string> updated_paths;
   updated_paths.reserve(config_list->config_size());
   for (const ModelConfig& config : config_list->config()) {
+    // Don't modify absolute paths.
+    if (!UriIsRelativePath(config.base_path())) {
+      updated_paths.push_back(config.base_path());
+      continue;
+    }
     updated_paths.emplace_back(
         io::JoinPath(model_config_list_root_dir, config.base_path()));
     if (UriIsRelativePath(updated_paths.back())) {
@@ -225,12 +225,12 @@ Status UpdateModelConfigListRelativePaths(
 Status ServerCore::Create(Options options,
                           std::unique_ptr<ServerCore>* server_core) {
   if (options.servable_state_monitor_creator == nullptr) {
-    options.servable_state_monitor_creator = [](
-        EventBus<ServableState>* event_bus,
-        std::unique_ptr<ServableStateMonitor>* monitor) {
-      monitor->reset(new ServableStateMonitor(event_bus));
-      return Status::OK();
-    };
+    options.servable_state_monitor_creator =
+        [](EventBus<ServableState>* event_bus,
+           std::unique_ptr<ServableStateMonitor>* monitor) {
+          monitor->reset(new ServableStateMonitor(event_bus));
+          return Status::OK();
+        };
   }
 
   if (options.server_request_logger == nullptr) {
@@ -295,10 +295,24 @@ Status ServerCore::WaitUntilModelsAvailable(const std::set<string>& models,
       awaited_servables, ServableState::ManagerState::kAvailable,
       &states_reached);
   if (!all_models_available) {
-    string message = "Some models did not become available: {";
+    const int num_unavailable_models = std::count_if(
+        states_reached.begin(), states_reached.end(),
+        [](const std::pair<ServableId, ServableState::ManagerState>&
+               id_and_state) {
+          return id_and_state.second != ServableState::ManagerState::kAvailable;
+        });
+    string message = strings::StrCat(num_unavailable_models,
+                                     " model(s) did not become available: {");
     for (const auto& id_and_state : states_reached) {
       if (id_and_state.second != ServableState::ManagerState::kAvailable) {
-        strings::StrAppend(&message, id_and_state.first.DebugString(), ", ");
+        optional<ServableState> maybe_state =
+            monitor->GetState(id_and_state.first);
+        const string error_msg =
+            maybe_state && !maybe_state.value().health.ok()
+                ? " due to error: " + maybe_state.value().health.ToString()
+                : "";
+        strings::StrAppend(&message, "{", id_and_state.first.DebugString(),
+                           error_msg, "}, ");
       }
     }
     strings::StrAppend(&message, "}");
@@ -390,20 +404,25 @@ Status ServerCore::AddModelsViaCustomModelConfig() {
       config_.custom_model_config(), servable_event_bus_.get(), &manager_);
 }
 
-Status ServerCore::MaybeUpdateServerRequestLogger() {
+Status ServerCore::MaybeUpdateServerRequestLogger(
+    const ModelServerConfig::ConfigCase config_case) {
   if (options_.server_request_logger_updater) {
     return options_.server_request_logger_updater(
         config_, options_.server_request_logger.get());
   }
 
-  std::map<string, LoggingConfig> logging_config_map;
-  for (const auto& model_config : config_.model_config_list().config()) {
-    if (model_config.has_logging_config()) {
-      logging_config_map.insert(
-          {model_config.name(), model_config.logging_config()});
+  if (config_case == ModelServerConfig::kModelConfigList) {
+    std::map<string, std::vector<LoggingConfig>> logging_config_map;
+    for (const auto& model_config : config_.model_config_list().config()) {
+      if (model_config.has_logging_config()) {
+        logging_config_map.insert(
+            {model_config.name(), {model_config.logging_config()}});
+      }
     }
+    return options_.server_request_logger->Update(logging_config_map);
   }
-  return options_.server_request_logger->Update(logging_config_map);
+
+  return Status::OK();
 }
 
 Status ServerCore::ReloadConfig(const ModelServerConfig& new_config) {
@@ -438,6 +457,8 @@ Status ServerCore::ReloadConfig(const ModelServerConfig& new_config) {
   }
   config_ = new_config;
 
+  TF_RETURN_IF_ERROR(UpdateModelVersionLabelMap());
+
   LOG(INFO) << "Adding/updating models.";
   switch (config_.config_case()) {
     case ModelServerConfig::kModelConfigList: {
@@ -459,7 +480,63 @@ Status ServerCore::ReloadConfig(const ModelServerConfig& new_config) {
     default:
       return errors::InvalidArgument("Invalid ServerModelConfig");
   }
-  TF_RETURN_IF_ERROR(MaybeUpdateServerRequestLogger());
+  TF_RETURN_IF_ERROR(MaybeUpdateServerRequestLogger(config_.config_case()));
+
+  if (options_.flush_filesystem_caches) {
+    return Env::Default()->FlushFileSystemCaches();
+  }
+
+  return Status::OK();
+}
+
+Status ServerCore::UpdateModelVersionLabelMap() {
+  std::unique_ptr<std::map<string, std::map<string, int64>>> new_label_map(
+      new std::map<string, std::map<string, int64>>);
+  for (const ModelConfig& model_config : config_.model_config_list().config()) {
+    ServableStateMonitor::VersionMap serving_states =
+        servable_state_monitor_->GetVersionStates(model_config.name());
+
+    for (const auto& entry : model_config.version_labels()) {
+      const string& label = entry.first;
+      const int64 version = entry.second;
+
+      bool contains_existing_label_with_different_version = false;
+      int64 existing_version;
+      if (GetModelVersionForLabel(model_config.name(), label, &existing_version)
+              .ok() &&
+          existing_version != version) {
+        contains_existing_label_with_different_version = true;
+      }
+      bool allow_version_labels_for_unavailable_models =
+          options_.allow_version_labels_for_unavailable_models &&
+          (!contains_existing_label_with_different_version);
+
+      // Verify that the label points to a version that is currently available.
+      auto serving_states_it = serving_states.find(version);
+      if (!allow_version_labels_for_unavailable_models &&
+          (serving_states_it == serving_states.end() ||
+           serving_states_it->second.state.manager_state !=
+               ServableState::ManagerState::kAvailable)) {
+        return errors::FailedPrecondition(strings::StrCat(
+            "Request to assign label to version ", version, " of model ",
+            model_config.name(),
+            ", which is not currently available for inference"));
+      }
+
+      (*new_label_map)[model_config.name()][label] = version;
+    }
+  }
+
+  if (!options_.allow_version_labels) {
+    if (!new_label_map->empty()) {
+      return errors::FailedPrecondition(
+          "Model version labels are not currently allowed by the server.");
+    }
+    return Status::OK();
+  }
+
+  mutex_lock l(model_labels_to_versions_mu_);
+  model_labels_to_versions_.swap(new_label_map);
 
   return Status::OK();
 }
@@ -488,6 +565,10 @@ FileSystemStoragePathSourceConfig ServerCore::CreateStoragePathSourceConfig(
   FileSystemStoragePathSourceConfig source_config;
   source_config.set_file_system_poll_wait_seconds(
       options_.file_system_poll_wait_seconds);
+  source_config.set_fail_if_zero_versions_at_startup(
+      options_.fail_if_no_model_versions_found);
+  source_config.set_servable_versions_always_present(
+      options_.servable_versions_always_present);
   for (const auto& model : config.model_config_list().config()) {
     LOG(INFO) << " (Re-)adding model: " << model.name();
     FileSystemStoragePathSourceConfig::ServableToMonitor* servable =
@@ -633,7 +714,10 @@ Status ServerCore::CreateAspiredVersionsManager(
   manager_options.num_load_threads = options_.num_load_threads;
   manager_options.num_unload_threads = options_.num_unload_threads;
   manager_options.max_num_load_retries = options_.max_num_load_retries;
+  manager_options.load_retry_interval_micros =
+      options_.load_retry_interval_micros;
   manager_options.pre_load_hook = std::move(options_.pre_load_hook);
+  manager_options.flush_filesystem_caches = options_.flush_filesystem_caches;
   const tensorflow::Status status =
       AspiredVersionsManager::Create(std::move(manager_options), manager);
   if (!status.ok()) {
@@ -670,13 +754,52 @@ Status ServerCore::ServableRequestFromModelSpec(
   if (model_spec.name().empty()) {
     return errors::InvalidArgument("ModelSpec has no name specified.");
   }
-  if (model_spec.has_version()) {
-    *servable_request = ServableRequest::Specific(model_spec.name(),
-                                                  model_spec.version().value());
-  } else {
-    *servable_request = ServableRequest::Latest(model_spec.name());
+
+  switch (model_spec.version_choice_case()) {
+    case ModelSpec::kVersion: {
+      *servable_request = ServableRequest::Specific(
+          model_spec.name(), model_spec.version().value());
+      break;
+    }
+    case ModelSpec::kVersionLabel: {
+      if (!options_.allow_version_labels) {
+        return errors::InvalidArgument(
+            "ModelSpec has 'version_label' set, but it is not currently "
+            "allowed by the server.");
+      }
+      int64 version;
+      TF_RETURN_IF_ERROR(GetModelVersionForLabel(
+          model_spec.name(), model_spec.version_label(), &version));
+      *servable_request = ServableRequest::Specific(model_spec.name(), version);
+      break;
+    }
+    case ModelSpec::VERSION_CHOICE_NOT_SET: {
+      *servable_request = ServableRequest::Latest(model_spec.name());
+      break;
+    }
   }
   return Status::OK();
+}
+
+Status ServerCore::GetModelVersionForLabel(const string& model_name,
+                                           const string& label,
+                                           int64* version) const {
+  mutex_lock l(model_labels_to_versions_mu_);
+  if (model_labels_to_versions_ == nullptr) {
+    return errors::Unavailable(
+        strings::StrCat("Model labels does not init yet.", label));
+  }
+  auto version_map_it = model_labels_to_versions_->find(model_name);
+  if (version_map_it != model_labels_to_versions_->end()) {
+    const std::map<string, int64>& version_map = version_map_it->second;
+    auto version_it = version_map.find(label);
+    if (version_it != version_map.end()) {
+      *version = version_it->second;
+      return Status::OK();
+    }
+  }
+  return errors::InvalidArgument(
+      strings::StrCat("Unrecognized servable version label: ", label));
 }
 
 }  //  namespace serving

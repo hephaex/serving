@@ -23,7 +23,9 @@ limitations under the License.
 #include <utility>
 
 #include "google/protobuf/any.pb.h"
+#include "absl/base/macros.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/platform/cpu_info.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/types.h"
@@ -38,6 +40,7 @@ limitations under the License.
 #include "tensorflow_serving/core/source.h"
 #include "tensorflow_serving/core/source_adapter.h"
 #include "tensorflow_serving/core/storage_path.h"
+#include "tensorflow_serving/servables/tensorflow/predict_util.h"
 #include "tensorflow_serving/sources/storage_path/file_system_storage_path_source.h"
 #include "tensorflow_serving/util/event_bus.h"
 #include "tensorflow_serving/util/optional.h"
@@ -112,10 +115,28 @@ class ServerCore : public Manager {
 
     // Maximum number of times we retry loading a model, after the first
     // failure, before we give up.
+    //
+    // If set to 0, a load is attempted only once.
     int32 max_num_load_retries = 5;
+
+    // The interval, in microseconds, between each servable load retry. If set
+    // negative, we don't wait.
+    // Default: 1 minute.
+    int64 load_retry_interval_micros = 1LL * 60 * 1000 * 1000;
 
     // Time interval between file-system polls, in seconds.
     int32 file_system_poll_wait_seconds = 30;
+
+    // If true, filesystem caches are flushed in the following cases:
+    //
+    // 1) After the initial models are loaded.
+    // 2) After a new config is supplied and a changed set of models are loaded.
+    // 3) After each new model version is loaded, if num_load_threads == 1.
+    //
+    // In the common scenario where the number of load threads is set to 1 after
+    // the initial load, this will take care of flushing the cache once after
+    // the initial load, and after every subsequent load of every model version.
+    bool flush_filesystem_caches = false;
 
     // Configuration for the supported platforms.
     PlatformConfigMap platform_config_map;
@@ -128,6 +149,23 @@ class ServerCore : public Manager {
     // adapters to the manager.
     CustomModelConfigLoader custom_model_config_loader;
 
+    // Whether to permit incoming ModelSpec requests to use the 'version_label'
+    // field.
+    bool allow_version_labels = true;
+
+    // If set to true, the server will fail to start up (or fail a config
+    // reload) if, for any configured model, no versions of the model are found
+    // in the filesystem under the model's base path.
+    ABSL_DEPRECATED("Use servable_versions_always_present.")
+    bool fail_if_no_model_versions_found = false;
+
+    // If set to true, the server will fail to start up (or fail a config
+    // reload) if, for any configured model, no versions of the model are found
+    // in the filesystem under the model's base path. In addition, if the
+    // filesystem polling finds no servables under the base path for a
+    // configured model, it will do nothing, rather than unloading all versions.
+    bool servable_versions_always_present = false;
+
     // Logger used for logging requests hitting the server.
     std::unique_ptr<ServerRequestLogger> server_request_logger;
 
@@ -137,6 +175,17 @@ class ServerCore : public Manager {
     // Callback to be called just before a servable is to be loaded. This will
     // called on the same manager load thread which starts the load.
     PreLoadHook pre_load_hook;
+
+    // Whether to allow assigning unused version labels to models that are not
+    // available yet.
+    bool allow_version_labels_for_unavailable_models = false;
+
+    // In a predict handler, this option specifies how to serialize tensors
+    // (e.g: as proto fields or as proto content).
+    // Serialize as proto fields by default, for backward compatibility.
+    internal::PredictResponseTensorSerializationOption
+        predict_response_tensor_serialization_option =
+            internal::PredictResponseTensorSerializationOption::kAsProtoField;
   };
 
   virtual ~ServerCore() = default;
@@ -166,17 +215,21 @@ class ServerCore : public Manager {
       LOCKS_EXCLUDED(config_mu_);
 
   /// Returns ServableStateMonitor that can be used to query servable states.
-  virtual const ServableStateMonitor* servable_state_monitor() const {
+  virtual ServableStateMonitor* servable_state_monitor() const {
     return servable_state_monitor_.get();
   }
 
-  /// Returns a ServableHandle given a ServableRequest. Returns error if no such
+  /// Returns a ServableHandle given a ModelSpec. Returns error if no such
   /// Servable is available -- e.g. not yet loaded, has been quiesced/unloaded,
   /// etc. Callers may assume that an OK status indicates a non-null handle.
   ///
   /// IMPORTANT: The caller should only hold on to a handle for a short time,
   /// for example for the duration of a single request. Holding a handle for a
   /// long period of time will prevent servable loading and unloading.
+  ///
+  /// If 'options_.allow_version_labels==true', recognizes two specific model
+  /// version labels -- "stable" and "canary" -- and resolves them to the
+  /// smallest and largest available version, respectively.
   template <typename T>
   Status GetServableHandle(const ModelSpec& model_spec,
                            ServableHandle<T>* const handle) {
@@ -198,9 +251,15 @@ class ServerCore : public Manager {
   /// Writes the log for the particular request, response and metadata, if we
   /// decide to sample it and if request-logging was configured for the
   /// particular model.
-  Status Log(const google::protobuf::Message& request, const google::protobuf::Message& response,
-             const LogMetadata& log_metadata) {
+  virtual Status Log(const google::protobuf::Message& request,
+                     const google::protobuf::Message& response,
+                     const LogMetadata& log_metadata) {
     return options_.server_request_logger->Log(request, response, log_metadata);
+  }
+
+  internal::PredictResponseTensorSerializationOption
+  predict_response_tensor_serialization_option() const {
+    return options_.predict_response_tensor_serialization_option;
   }
 
  protected:
@@ -301,7 +360,17 @@ class ServerCore : public Manager {
   Status AddModelsViaCustomModelConfig() EXCLUSIVE_LOCKS_REQUIRED(config_mu_);
 
   // Updates the ServerRequestLogger based on the ModelConfigList.
-  Status MaybeUpdateServerRequestLogger() EXCLUSIVE_LOCKS_REQUIRED(config_mu_);
+  Status MaybeUpdateServerRequestLogger(
+      ModelServerConfig::ConfigCase config_case)
+      EXCLUSIVE_LOCKS_REQUIRED(config_mu_);
+
+  // Updates 'model_labels_to_versions_' based on 'config_'. Throws an error if
+  // requesting to assign an existing label to a version not in state
+  // kAvailable. For a new version label, it can be assigned to a version that
+  // is not in state kAvailable yet if
+  // allow_version_labels_for_unavailable_models is true.
+  Status UpdateModelVersionLabelMap() EXCLUSIVE_LOCKS_REQUIRED(config_mu_)
+      LOCKS_EXCLUDED(model_labels_to_versions_mu_);
 
   // ************************************************************************
   // Request Processing.
@@ -310,6 +379,11 @@ class ServerCore : public Manager {
   // Extracts a ServableRequest from the given ModelSpec.
   Status ServableRequestFromModelSpec(const ModelSpec& model_spec,
                                       ServableRequest* servable_request) const;
+
+  // Gets the version associated with 'label', for the given model name.
+  Status GetModelVersionForLabel(const string& model_name, const string& label,
+                                 int64* version) const
+      LOCKS_EXCLUDED(model_labels_to_versions_mu_);
 
   Status GetUntypedServableHandle(
       const ServableRequest& request,
@@ -337,6 +411,10 @@ class ServerCore : public Manager {
   // The most recent config supplied to ReloadConfig().
   ModelServerConfig config_ GUARDED_BY(config_mu_);
 
+  // A model_name->label->version# map.
+  std::unique_ptr<std::map<string, std::map<string, int64>>>
+      model_labels_to_versions_ GUARDED_BY(model_labels_to_versions_mu_);
+
   struct StoragePathSourceAndRouter {
     FileSystemStoragePathSource* source;
     DynamicSourceRouter<StoragePath>* router;
@@ -349,7 +427,11 @@ class ServerCore : public Manager {
       GUARDED_BY(config_mu_);
 
   // A mutex for reconfiguration, used by ReloadConfig().
-  mutex config_mu_;
+  mutable mutex config_mu_;
+
+  // A mutex for swapping the model version label map. Should only be held for
+  // a short time (i.e. pointer swap) to avoid holding up inference requests.
+  mutable mutex model_labels_to_versions_mu_;
 };
 
 }  // namespace serving

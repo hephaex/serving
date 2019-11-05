@@ -1,5 +1,7 @@
 # Description: Tensorflow Serving utils.
 
+load("//tensorflow_serving:serving.bzl", "serving_proto_library", "serving_proto_library_py")
+
 package(
     default_visibility = [
         "//tensorflow_serving:internal",
@@ -48,20 +50,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":class_registration_util",
-        "@org_tensorflow//tensorflow/core:lib",
-        "@protobuf_archive//:cc_wkt_protos",
-    ],
-)
-
-###############################################################################
-#                  Internal targets
-###############################################################################
-
-cc_library(
-    name = "hash",
-    srcs = ["hash.cc"],
-    hdrs = ["hash.h"],
-    deps = [
+        "@com_google_protobuf//:cc_wkt_protos",
         "@org_tensorflow//tensorflow/core:lib",
     ],
 )
@@ -69,6 +58,31 @@ cc_library(
 cc_library(
     name = "observer",
     hdrs = ["observer.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@org_tensorflow//tensorflow/core:lib",
+    ],
+)
+
+cc_library(
+    name = "prometheus_exporter",
+    srcs = ["prometheus_exporter.cc"],
+    hdrs = ["prometheus_exporter.h"],
+    deps = [
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_googlesource_code_re2//:re2",
+        "@org_tensorflow//tensorflow/core:lib",
+    ],
+)
+
+###############################################################################
+#                  Internal targets
+###############################################################################
+cc_library(
+    name = "hash",
+    srcs = ["hash.cc"],
+    hdrs = ["hash.h"],
     deps = [
         "@org_tensorflow//tensorflow/core:lib",
     ],
@@ -81,7 +95,20 @@ cc_test(
     deps = [
         ":observer",
         "//tensorflow_serving/core/test_util:test_main",
-        "@org_tensorflow//tensorflow/contrib/batching/util:periodic_function",
+        "@org_tensorflow//tensorflow/core:lib",
+        "@org_tensorflow//tensorflow/core/kernels/batching_util:periodic_function",
+    ],
+)
+
+cc_test(
+    name = "prometheus_exporter_test",
+    size = "small",
+    srcs = ["prometheus_exporter_test.cc"],
+    deps = [
+        ":prometheus_exporter",
+        "//tensorflow_serving/core/test_util:test_main",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/strings",
         "@org_tensorflow//tensorflow/core:lib",
     ],
 )
@@ -93,13 +120,14 @@ cc_test(
     deps = [
         ":event_bus",
         "//tensorflow_serving/core/test_util:test_main",
-        "@org_tensorflow//tensorflow/contrib/batching/test_util:fake_clock_env",
+        "@org_tensorflow//tensorflow/core/kernels/batching_util:fake_clock_env",
     ],
 )
 
 cc_library(
     name = "fast_read_dynamic_ptr",
     hdrs = ["fast_read_dynamic_ptr.h"],
+    visibility = ["//visibility:public"],
     deps = [
         "@org_tensorflow//tensorflow/core:lib",
     ],
@@ -121,10 +149,11 @@ cc_test(
     srcs = ["fast_read_dynamic_ptr_benchmark.cc"],
     deps = [
         ":fast_read_dynamic_ptr",
-        "@org_tensorflow//tensorflow/contrib/batching/util:periodic_function",
+        "@com_google_absl//absl/time",
         "@org_tensorflow//tensorflow/core:lib",
         "@org_tensorflow//tensorflow/core:tensorflow",
         "@org_tensorflow//tensorflow/core:test",
+        "@org_tensorflow//tensorflow/core/kernels/batching_util:periodic_function_dynamic",
     ],
 )
 
@@ -262,6 +291,7 @@ cc_library(
     srcs = ["class_registration_util.cc"],
     hdrs = ["class_registration_util.h"],
     deps = [
+        "@com_google_absl//absl/strings",
         "@org_tensorflow//tensorflow/core:lib",
     ],
 )
@@ -297,7 +327,62 @@ cc_test(
     ],
 )
 
-load("//tensorflow_serving:serving.bzl", "serving_proto_library")
+cc_library(
+    name = "status_util",
+    srcs = ["status_util.cc"],
+    hdrs = ["status_util.h"],
+    deps = [
+        ":status_proto",
+        "@org_tensorflow//tensorflow/core:lib",
+    ],
+)
+
+cc_library(
+    name = "json_tensor",
+    srcs = ["json_tensor.cc"],
+    hdrs = ["json_tensor.h"],
+    deps = [
+        "//tensorflow_serving/apis:classification_proto",
+        "//tensorflow_serving/apis:input_proto",
+        "//tensorflow_serving/apis:model_proto",
+        "//tensorflow_serving/apis:predict_proto",
+        "//tensorflow_serving/apis:regression_proto",
+        "@com_github_tencent_rapidjson//:rapidjson",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@org_tensorflow//tensorflow/core:framework",
+        "@org_tensorflow//tensorflow/core:lib",
+        "@org_tensorflow//tensorflow/core:protos_all_cc",
+    ],
+)
+
+cc_test(
+    name = "status_util_test",
+    srcs = ["status_util_test.cc"],
+    deps = [
+        ":status_util",
+        "//tensorflow_serving/core/test_util:test_main",
+    ],
+)
+
+cc_test(
+    name = "json_tensor_test",
+    srcs = ["json_tensor_test.cc"],
+    deps = [
+        ":json_tensor",
+        "//tensorflow_serving/apis:classification_proto",
+        "//tensorflow_serving/apis:model_proto",
+        "//tensorflow_serving/apis:predict_proto",
+        "//tensorflow_serving/apis:regression_proto",
+        "//tensorflow_serving/core/test_util:test_main",
+        "//tensorflow_serving/test_util",
+        "@com_google_protobuf//:protobuf",
+        "@org_tensorflow//tensorflow/core:framework",
+        "@org_tensorflow//tensorflow/core:lib",
+        "@org_tensorflow//tensorflow/core:protos_all_cc",
+        "@org_tensorflow//tensorflow/core:test",
+    ],
+)
 
 serving_proto_library(
     name = "class_registration_test_proto",
@@ -305,6 +390,30 @@ serving_proto_library(
     srcs = ["class_registration_test.proto"],
     cc_api_version = 2,
     deps = [
-        "@protobuf_archive//:cc_wkt_protos",
+        "@com_google_protobuf//:cc_wkt_protos",
     ],
+)
+
+serving_proto_library(
+    name = "status_proto",
+    srcs = ["status.proto"],
+    cc_api_version = 2,
+    visibility = ["//visibility:public"],
+    deps = [
+        "@org_tensorflow//tensorflow/core:protos_all_cc",
+    ],
+)
+
+serving_proto_library_py(
+    name = "status_proto_py_pb2",
+    srcs = ["status.proto"],
+    proto_library = "status_proto",
+    deps = [
+        "@org_tensorflow//tensorflow/core:protos_all_py",
+    ],
+)
+
+cc_library(
+    name = "oss_or_google",
+    hdrs = ["oss_or_google.h"],
 )

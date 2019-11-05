@@ -16,7 +16,7 @@ limitations under the License.
 #include "tensorflow_serving/servables/tensorflow/bundle_factory_util.h"
 
 #include "google/protobuf/wrappers.pb.h"
-#include "tensorflow/contrib/batching/batch_scheduler.h"
+#include "tensorflow/core/kernels/batching_util/batch_scheduler.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/platform/env.h"
@@ -177,7 +177,8 @@ Status WrapSessionForBatching(const BatchingParameters& batching_config,
     batching_session_options.allowed_batch_sizes.push_back(allowed_batch_size);
   }
 
-  batching_session_options.pad_variable_length_inputs = batching_config.pad_variable_length_inputs();
+  batching_session_options.pad_variable_length_inputs =
+      batching_config.pad_variable_length_inputs();
 
   auto create_queue = [batch_scheduler, queue_options](
       std::function<void(std::unique_ptr<Batch<BatchingSessionTask>>)>

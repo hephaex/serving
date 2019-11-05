@@ -16,6 +16,7 @@ limitations under the License.
 #include "tensorflow_serving/servables/tensorflow/classifier.h"
 
 #include <stddef.h>
+
 #include <algorithm>
 #include <functional>
 #include <memory>
@@ -23,7 +24,6 @@ limitations under the License.
 #include <vector>
 
 #include "tensorflow/cc/saved_model/signature_constants.h"
-#include "tensorflow/contrib/session_bundle/signature.h"
 #include "tensorflow/core/example/example.pb.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/lib/core/errors.h"
@@ -36,6 +36,7 @@ limitations under the License.
 #include "tensorflow_serving/apis/input.pb.h"
 #include "tensorflow_serving/apis/model.pb.h"
 #include "tensorflow_serving/servables/tensorflow/util.h"
+#include "tensorflow_serving/session_bundle/session_bundle_util.h"
 
 namespace tensorflow {
 namespace serving {
@@ -63,6 +64,7 @@ class TensorFlowClassifier : public ClassifierInterface {
     if (num_examples == 0) {
       return errors::InvalidArgument("ClassificationRequest::input is empty.");
     }
+    RecordRequestExampleCount(request.model_spec().name(), num_examples);
 
     TRACELITERAL("RunClassification");
     // Support serving models that return classes, scores or both.
@@ -75,8 +77,8 @@ class TensorFlowClassifier : public ClassifierInterface {
       scores.reset(new Tensor);
     }
 
-    TF_RETURN_IF_ERROR(RunClassification(*signature_, input_tensor, session_,
-                                         classes.get(), scores.get()));
+    TF_RETURN_IF_ERROR(session_bundle::RunClassification(
+        *signature_, input_tensor, session_, classes.get(), scores.get()));
 
     // Validate classes output Tensor.
     if (classes) {
@@ -205,8 +207,8 @@ class SessionBundleClassifier : public ClassifierInterface {
     // TODO(b/26220896): Move TensorFlowClassifier creation to construction
     // time.
     ClassificationSignature signature;
-    TF_RETURN_IF_ERROR(
-        GetClassificationSignature(bundle_->meta_graph_def, &signature));
+    TF_RETURN_IF_ERROR(session_bundle::GetClassificationSignature(
+        bundle_->meta_graph_def, &signature));
 
     TensorFlowClassifier classifier(bundle_->session.get(), &signature);
     return classifier.Classify(request, result);
@@ -441,6 +443,27 @@ Status PostProcessClassificationResult(
     }
   }
   return Status::OK();
+}
+
+Status RunClassify(const RunOptions& run_options,
+                   const MetaGraphDef& meta_graph_def,
+                   const optional<int64>& servable_version, Session* session,
+                   const ClassificationRequest& request,
+                   ClassificationResponse* response) {
+  SignatureDef signature;
+  TF_RETURN_IF_ERROR(GetClassificationSignatureDef(request.model_spec(),
+                                                   meta_graph_def, &signature));
+
+  std::unique_ptr<ClassifierInterface> classifier_interface;
+  TF_RETURN_IF_ERROR(CreateFlyweightTensorFlowClassifier(
+      run_options, session, &signature, &classifier_interface));
+
+  MakeModelSpec(request.model_spec().name(),
+                request.model_spec().signature_name(), servable_version,
+                response->mutable_model_spec());
+
+  // Run classification.
+  return classifier_interface->Classify(request, response->mutable_result());
 }
 
 }  // namespace serving

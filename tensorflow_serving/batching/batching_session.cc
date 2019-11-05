@@ -26,10 +26,11 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/profiler/lib/traceme.h"
+#include "tensorflow_serving/batching/batching_util.h"
 #include "tensorflow_serving/servables/tensorflow/serving_session.h"
 #include "tensorflow_serving/util/cleanup.h"
 #include "tensorflow_serving/util/hash.h"
-#include "tensorflow_serving/batching/batching_util.h"
 #include "tensorflow_serving/util/optional.h"
 
 namespace tensorflow {
@@ -88,7 +89,7 @@ std::vector<std::vector<std::pair<string, Tensor>>> GetTaskInputsVector(
   std::vector<std::vector<std::pair<string, Tensor>>> all_task_inputs;
   for (int i = 0; i < batch.num_tasks(); ++i) {
     const std::vector<std::pair<string, Tensor>>& task_inputs =
-      *batch.task(i).inputs;
+        *batch.task(i).inputs;
     all_task_inputs.push_back(task_inputs);
   }
   return all_task_inputs;
@@ -97,7 +98,7 @@ std::vector<std::vector<std::pair<string, Tensor>>> GetTaskInputsVector(
 // the first (not zeroth) dimension.
 // For example, for shapes [1, 2, 3] and [4, 2, 3] the result is true.
 bool AreShapesEqualExceptZeroDim(const TensorShape& shape1,
-    const TensorShape& shape2) {
+                                 const TensorShape& shape2) {
   if (shape1.dims() != shape2.dims()) {
     return false;
   }
@@ -268,6 +269,7 @@ Status BatchingSession::Run(
         "BatchingSession does not support target nodes");
   }
 
+  profiler::TraceMe trace_me("BatchingSessionRun");
   const TensorSignature signature =
       TensorSignatureFromRunArgs(inputs, output_tensor_names);
   auto batch_scheduler_it = batch_schedulers_.find(signature);
@@ -318,7 +320,7 @@ BatchingSession::BatchingSession(const BatchingSessionOptions& options)
 
 Status BatchingSession::ComputeInputSize(
     const std::vector<std::pair<string, Tensor>>& inputs, size_t* size) const {
-  if (inputs.size() == 0) {
+  if (inputs.empty()) {
     return errors::InvalidArgument(
         "Batching session Run() must have at least one input tensor");
   }
@@ -381,7 +383,7 @@ Status BatchingSession::MergeInputTensors(
   optional<std::map<string, std::vector<int>>> max_dim_sizes;
   if (options_.pad_variable_length_inputs) {
     std::vector<std::vector<std::pair<string, Tensor>>> all_task_inputs =
-      GetTaskInputsVector(batch);
+        GetTaskInputsVector(batch);
     max_dim_sizes = CalculateMaxDimSizes(all_task_inputs);
   }
   // Populate 'tensors_to_merge'.
@@ -403,14 +405,14 @@ Status BatchingSession::MergeInputTensors(
         // (except zeroth dim) when padding is turned off.
         if (i > 0) {  // added at least one task to tensors_to_merge
           TensorShape reference_shape =
-            tensors_to_merge[tensor_name][0].shape();
+              tensors_to_merge[tensor_name][0].shape();
           if (!AreShapesEqualExceptZeroDim(tensor.shape(), reference_shape)) {
             return errors::FailedPrecondition(
-              "Tensors with name '" + tensor_name + "' from different tasks" +
-              " have different shapes and padding is turned off." +
-              "Set pad_variable_length_inputs to true, or ensure that " +
-              "all tensors with the same name" +
-              "have equal dimensions starting with the first dim.");
+                "Tensors with name '" + tensor_name + "' from different tasks" +
+                " have different shapes and padding is turned off." +
+                "Set pad_variable_length_inputs to true, or ensure that " +
+                "all tensors with the same name" +
+                "have equal dimensions starting with the first dim.");
           }
         }
       }

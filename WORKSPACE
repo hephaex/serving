@@ -1,26 +1,43 @@
 workspace(name = "tf_serving")
 
-local_repository(
+# To update TensorFlow to a new revision.
+# 1. Update the 'git_commit' args below to include the new git hash.
+# 2. Get the sha256 hash of the archive with a command such as...
+#    curl -L https://github.com/tensorflow/tensorflow/archive/<git hash>.tar.gz | sha256sum
+#    and update the 'sha256' arg with the result.
+# 3. Request the new archive to be mirrored on mirror.bazel.build for more
+#    reliable downloads.
+load("//tensorflow_serving:repo.bzl", "tensorflow_http_archive")
+tensorflow_http_archive(
     name = "org_tensorflow",
-    path = "tensorflow",
+    sha256 = "44a9bd1fc775ab804877f816df7e6f3d8238020b266e7c41010362a133af3965",
+    git_commit = "f63cc98935c2c1cf8a42eaa5951c66a3e16c8d5a",
 )
 
-# TensorFlow depends on "io_bazel_rules_closure" so we need this here.
-# Needs to be kept in sync with the same target in TensorFlow's WORKSPACE file.
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+# START: Upstream TensorFlow dependencies
+# TensorFlow build depends on these dependencies.
+# Needs to be in-sync with TensorFlow sources.
 http_archive(
     name = "io_bazel_rules_closure",
-    sha256 = "25f5399f18d8bf9ce435f85c6bbf671ec4820bc4396b3022cc5dc4bc66303609",
-    strip_prefix = "rules_closure-0.4.2",
+    sha256 = "5b00383d08dd71f28503736db0500b6fb4dda47489ff5fc6bed42557c07c6ba9",
+    strip_prefix = "rules_closure-308b05b2419edb5c8ee0471b67a40403df940149",
     urls = [
-        "http://mirror.bazel.build/github.com/bazelbuild/rules_closure/archive/0.4.2.tar.gz",  # 2017-08-30
-        "https://github.com/bazelbuild/rules_closure/archive/0.4.2.tar.gz",
+        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/bazelbuild/rules_closure/archive/308b05b2419edb5c8ee0471b67a40403df940149.tar.gz",
+        "https://github.com/bazelbuild/rules_closure/archive/308b05b2419edb5c8ee0471b67a40403df940149.tar.gz",  # 2019-06-13
     ],
 )
+http_archive(
+    name = "bazel_skylib",
+    sha256 = "2ef429f5d7ce7111263289644d233707dba35e39696377ebab8b0bc701f7818e",
+    urls = ["https://github.com/bazelbuild/bazel-skylib/releases/download/0.8.0/bazel-skylib.0.8.0.tar.gz"],
+)  # https://github.com/bazelbuild/bazel-skylib/releases
+# END: Upstream TensorFlow dependencies
 
 # Please add all new TensorFlow Serving dependencies in workspace.bzl.
-load('//tensorflow_serving:workspace.bzl', 'tf_serving_workspace')
+load("//tensorflow_serving:workspace.bzl", "tf_serving_workspace")
 tf_serving_workspace()
 
 # Specify the minimum required bazel version.
-load("@org_tensorflow//tensorflow:workspace.bzl", "check_version")
-check_version("0.4.5")
+load("@org_tensorflow//tensorflow:version_check.bzl", "check_bazel_version_at_least")
+check_bazel_version_at_least("0.24.1")

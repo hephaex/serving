@@ -26,6 +26,7 @@ cc_library(
     testonly = 1,
     srcs = ["test_main.cc"],
     linkopts = ["-lm"],
+    tags = ["keep_dep"],  # Tell build_cleaner to keep dependencies on this.
     deps = [
         "@com_google_googletest//:gtest",
         "@org_tensorflow//tensorflow/core:testlib",
@@ -152,8 +153,8 @@ cc_library(
     deps = [
         "//tensorflow_serving/core:log_collector",
         "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:lib",
-        "@protobuf_archive//:protobuf",
     ],
 )
 
@@ -164,8 +165,8 @@ cc_library(
     deps = [
         "//tensorflow_serving/core:log_collector",
         "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:lib",
-        "@protobuf_archive//:protobuf",
     ],
 )
 
@@ -177,8 +178,19 @@ cc_library(
         "//tensorflow_serving/core:logging_proto",
         "//tensorflow_serving/core:request_logger",
         "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:lib",
-        "@protobuf_archive//:protobuf",
+    ],
+)
+
+cc_library(
+    name = "mock_server_request_logger",
+    testonly = 1,
+    hdrs = ["mock_server_request_logger.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tensorflow_serving/core:server_request_logger",
+        "@com_google_googletest//:gtest",
     ],
 )
 
@@ -191,4 +203,17 @@ cc_library(
         "@org_tensorflow//tensorflow/core:core_cpu",
         "@org_tensorflow//tensorflow/core:lib",
     ],
+)
+
+cc_library(
+    name = "session_test_util",
+    testonly = 1,
+    srcs = ["session_test_util.cc"],
+    hdrs = ["session_test_util.h"],
+    deps = [
+        "@org_tensorflow//tensorflow/core:core_cpu",
+        "@org_tensorflow//tensorflow/core:framework",
+        "@org_tensorflow//tensorflow/core:lib",
+    ],
+    alwayslink = 1,
 )

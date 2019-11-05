@@ -31,32 +31,35 @@ This tutorial steps through the following tasks:
 4.  Serve request with TensorFlow Serving `ServerCore`.
 5.  Run and test the service.
 
-Before getting started, please complete the
-[prerequisites](setup.md#prerequisites).
+Before getting started, first [install Docker](docker.md#installing-docker)
 
-Note: All `bazel build` commands below use the standard `-c opt` flag. To
-further optimize the build, refer to the
-[instructions here](setup.md#optimized-build).
+## Train and export TensorFlow Model
 
-## Train And Export TensorFlow Model
+First, if you haven't done so yet, clone this repository to your local machine:
+
+```shell
+git clone https://github.com/tensorflow/serving.git
+cd serving
+```
 
 Clear the export directory if it already exists:
 
 ```shell
-$>rm -rf /tmp/mnist_model
+rm -rf /tmp/models
 ```
 
 Train (with 100 iterations) and export the first version of model:
 
 ```shell
-$>bazel build -c opt //tensorflow_serving/example:mnist_saved_model
-$>bazel-bin/tensorflow_serving/example/mnist_saved_model --training_iteration=100 --model_version=1 /tmp/mnist_model
+tools/run_in_docker.sh python tensorflow_serving/example/mnist_saved_model.py \
+  --training_iteration=100 --model_version=1 /tmp/mnist
 ```
 
 Train (with 2000 iterations) and export the second version of model:
 
 ```shell
-$>bazel-bin/tensorflow_serving/example/mnist_saved_model --training_iteration=2000 --model_version=2 /tmp/mnist_model
+tools/run_in_docker.sh python tensorflow_serving/example/mnist_saved_model.py \
+  --training_iteration=2000 --model_version=2 /tmp/mnist
 ```
 
 As you can see in `mnist_saved_model.py`, the training and exporting is done the
@@ -66,10 +69,10 @@ iterations for the first run and exporting it as v1, while training it normally
 for the second run and exporting it as v2 to the same parent directory -- as we
 expect the latter to achieve better classification accuracy due to more
 intensive training. You should see training data for each training run in your
-`mnist_model` directory:
+`/tmp/mnist` directory:
 
-```shell
-$>ls /tmp/mnist_model
+```console
+$ ls /tmp/mnist
 1  2
 ```
 
@@ -165,8 +168,8 @@ that monitors cloud storage instead of local storage, or you could build a
 version policy plugin that does version transition in a different way -- in
 fact, you could even build a custom model plugin that serves non-TensorFlow
 models. These topics are out of scope for this tutorial. However, you can refer
-to the [custom source](custom_source.md) and [custom servable]
-(custom_servable.md) tutorials for more information.
+to the [custom source](custom_source.md) and
+[custom servable](custom_servable.md) tutorials for more information.
 
 ## Batching
 
@@ -250,7 +253,7 @@ To put all these into the context of this tutorial:
     servables that can be loaded.
 
   * `AspiredVersionsManager` monitors the export stream, and manages lifecycle
-    of all SavedModelBundle` servables dynamically.
+    of all `SavedModelBundle` servables dynamically.
 
 `TensorflowPredictImpl::Predict` then just:
 
@@ -259,28 +262,39 @@ To put all these into the context of this tutorial:
   `PredictRequest` to real tensor names and bind values to tensors.
   * Runs inference.
 
-## Test and Run The Server
+## Test and run the server
 
-Copy the first version of the export to the monitored folder and start the
-server.
+Copy the first version of the export to the monitored folder:
 
 ```shell
-$>mkdir /tmp/monitored
-$>cp -r /tmp/mnist_model/1 /tmp/monitored
-$>bazel build -c opt //tensorflow_serving/model_servers:tensorflow_model_server
-$>bazel-bin/tensorflow_serving/model_servers/tensorflow_model_server --enable_batching --port=9000 --model_name=mnist --model_base_path=/tmp/monitored
+mkdir /tmp/monitored
+cp -r /tmp/mnist/1 /tmp/monitored
+```
+
+Then start the server:
+
+```shell
+docker run -p 8500:8500 \
+  --mount type=bind,source=/tmp/monitored,target=/models/mnist \
+  -t --entrypoint=tensorflow_model_server tensorflow/serving --enable_batching \
+  --port=8500 --model_name=mnist --model_base_path=/models/mnist &
 ```
 
 The server will emit log messages every one second that say
 "Aspiring version for servable ...", which means it has found the export, and is
 tracking its continued existence.
 
-Run the test with `--concurrency=10`. This will send concurrent requests to the
-server and thus trigger your batching logic.
+Let's run the client with `--concurrency=10`. This will send concurrent requests
+to the server and thus trigger your batching logic.
 
 ```shell
-$>bazel build -c opt //tensorflow_serving/example:mnist_client
-$>bazel-bin/tensorflow_serving/example/mnist_client --num_tests=1000 --server=localhost:9000 --concurrency=10
+tools/run_in_docker.sh python tensorflow_serving/example/mnist_client.py \
+  --num_tests=1000 --server=127.0.0.1:8500 --concurrency=10
+```
+
+Which results in output that looks like:
+
+```console
 ...
 Inference error rate: 13.1%
 ```
@@ -289,8 +303,14 @@ Then we copy the second version of the export to the monitored folder and re-run
 the test:
 
 ```shell
-$>cp -r /tmp/mnist_model/2 /tmp/monitored
-$>bazel-bin/tensorflow_serving/example/mnist_client --num_tests=1000 --server=localhost:9000 --concurrency=10
+cp -r /tmp/mnist/2 /tmp/monitored
+tools/run_in_docker.sh python tensorflow_serving/example/mnist_client.py \
+  --num_tests=1000 --server=127.0.0.1:8500 --concurrency=10
+```
+
+Which results in output that looks like:
+
+```console
 ...
 Inference error rate: 9.5%
 ```
